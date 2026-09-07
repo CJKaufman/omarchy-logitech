@@ -333,8 +333,10 @@ def reclaim_lighting(entries):
 
     The claim is idempotent, and it reads the desired state from the cache
     rather than the device so it follows what the user asked for rather than
-    whatever the firmware reverted to.
+    whatever the firmware reverted to. Returns how many devices took the
+    claim, so a caller retrying after a resume knows when to stop.
     """
+    claimed = 0
     for entry in entries:
         control = next((s for s in entry["settings"] if s.name == "rgb_control"), None)
         if control is None:
@@ -346,11 +348,24 @@ def reclaim_lighting(entries):
         for setting in entry["settings"]:
             if setting.name in SOFTWARE_SETTINGS:
                 read_value(setting)
+        # Prime the zone effects too. solaar repaints the zones right after
+        # the claim, but only those whose in-memory value is already loaded —
+        # on a freshly built Device object none are, so the claim would take
+        # the lighting away from the firmware and then paint nothing. That is
+        # a keyboard that comes back from suspend (or boot) dark until
+        # something else writes an effect.
+        for setting in entry["settings"]:
+            if setting.name.startswith("rgb_zone_"):
+                try:
+                    setting.read(True)
+                except Exception:
+                    pass
         try:
-            if control.read(True):
-                control.write(True)
+            if control.read(True) and control.write(True) is not None:
+                claimed += 1
         except Exception:
             continue
+    return claimed
 
 
 def find_setting(entry, name):
@@ -927,6 +942,7 @@ class Daemon:
         self.notify_low = notify_low
         self.warned = set()
         self.stale = threading.Event()
+        self.hotplugged = threading.Event()
         self.lock = threading.Lock()
 
     def serve(self):
@@ -944,6 +960,8 @@ class Daemon:
 
         self.index.rebuild()
         threading.Thread(target=self.watch_hotplug, daemon=True).start()
+        threading.Thread(target=self.rebuild_after_hotplug, daemon=True).start()
+        threading.Thread(target=self.watch_resume, daemon=True).start()
         threading.Thread(target=self.watch_battery, daemon=True).start()
 
         while True:
@@ -1020,12 +1038,74 @@ class Daemon:
             for device in iter(monitor.poll, None):
                 if device.action in ("add", "remove"):
                     self.stale.set()
+                    self.hotplugged.set()
         except Exception:
             # No pyudev, or the netlink socket went away: fall back to marking
             # the index stale periodically so a hotplug is noticed eventually.
             while True:
                 time.sleep(max(30, self.poll))
                 self.stale.set()
+
+    def rebuild_after_hotplug(self, quiet=2.0):
+        """Rebuild soon after a hotplug instead of on the next request.
+
+        A keyboard back from suspend re-enumerates, and it is the rebuild's
+        reclaim that repaints its lighting — left to the panel's next poll,
+        it sits dark for up to a minute and a half. Events arrive in bursts
+        (the G915 re-enumerates twice, tens of seconds apart), so wait for a
+        quiet spell before paying for the rebuild.
+        """
+        while True:
+            self.hotplugged.wait()
+            while self.hotplugged.is_set():
+                self.hotplugged.clear()
+                time.sleep(quiet)
+            with self.lock:
+                if self.stale.is_set():
+                    self.stale.clear()
+                    try:
+                        self.index.rebuild()
+                    except Exception:
+                        # Leave it stale; the next request retries.
+                        self.stale.set()
+
+    def watch_resume(self, period=2.0, threshold=3.0):
+        """Notice the machine coming back from suspend.
+
+        CLOCK_BOOTTIME keeps counting through a suspend and CLOCK_MONOTONIC
+        does not, so the gap between them grows by exactly the time asleep.
+        udev alone is not enough: on some resumes the keyboard's USB port is
+        merely reset, no hidraw node comes or goes, and the daemon's Device
+        objects stay valid — but the keyboard powered its LEDs down while
+        under software control and shows nothing until the host pushes the
+        effects again.
+        """
+
+        def gap():
+            return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+
+        last = gap()
+        while True:
+            time.sleep(period)
+            now = gap()
+            if now - last > threshold:
+                self.on_resume()
+            last = now
+
+    def on_resume(self, delays=(2, 6, 15, 30)):
+        """Push the saved lighting back onto devices that survived a suspend.
+
+        The keyboard takes a moment to answer after waking, so retry on a
+        short schedule until a claim goes through. A device that instead
+        re-enumerated is handled by the hotplug rebuild, which reclaims too.
+        """
+        for delay in delays:
+            time.sleep(delay)
+            with self.lock:
+                if self.stale.is_set():
+                    return
+                if reclaim_lighting(self.index.entries):
+                    return
 
     def watch_battery(self):
         while True:
