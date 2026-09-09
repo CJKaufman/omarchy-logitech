@@ -844,6 +844,26 @@ Panel {
         }
       }
 
+      // Quick presets for sliders (such as standard mouse DPI steps)
+      Flow {
+        visible: !!row.control && row.control.ui === "slider" && !!row.control.presets && row.control.presets.length > 0
+        Layout.fillWidth: true
+        spacing: Style.space(6)
+
+        Repeater {
+          model: row.control && row.control.presets ? row.control.presets : []
+          Chip {
+            required property var modelData
+            text: String(modelData)
+            selected: row.control && Number(row.control.value) === Number(modelData)
+            onClicked: {
+              root.setCursor(row.deviceKey, row.controlName)
+              logitech.setControl(row.deviceKey, row.controlName, Number(modelData))
+            }
+          }
+        }
+      }
+
       // Choice settings become a strip of chips when they are few, so the
       // options are visible rather than hidden behind repeated clicking.
       Flow {
